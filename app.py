@@ -3,22 +3,20 @@ import requests
 import json
 from base64 import b64encode
 import pandas as pd
-from dotenv import load_dotenv
-import os
 import time
 
 # -----------------
-# Load credentials from .env
+# Load credentials from Streamlit secrets
 # -----------------
-load_dotenv()
-login = os.getenv("DATAFORSEO_LOGIN")
-password = os.getenv("DATAFORSEO_PASSWORD")
-if not login or not password:
-    st.error("❌ Missing credentials in .env file. Please add DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD.")
+try:
+    login = st.secrets["DATAFORSEO_LOGIN"]
+    password = st.secrets["DATAFORSEO_PASSWORD"]
+except KeyError:
+    st.error("❌ Missing credentials in Streamlit secrets. Please add DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD to your secrets.")
     st.stop()
 
 st.title("🔎 Local Keyword Volume Checker (DataForSEO)")
-st.info("🔑 Using DataForSEO credentials from .env")
+st.info("🔑 Using DataForSEO credentials from Streamlit secrets")
 
 # Auth setup
 auth = b64encode(f"{login}:{password}".encode()).decode()
@@ -28,46 +26,9 @@ headers = {
 }
 
 # -----------------
-# Load ALL locations with local caching
+# Load ALL locations with session state caching (instead of file caching)
 # -----------------
-CACHE_FILE = "locations_cache.json"
-CACHE_DAYS = 30  # Refresh cache after 30 days
-
-def is_cache_fresh():
-    """Check if the cache file exists and is fresh"""
-    if not os.path.exists(CACHE_FILE):
-        return False
-    
-    # Check file age
-    cache_age = time.time() - os.path.getmtime(CACHE_FILE)
-    cache_age_days = cache_age / (24 * 3600)
-    
-    return cache_age_days < CACHE_DAYS
-
-def load_locations_from_cache():
-    """Load locations from local cache file"""
-    try:
-        with open(CACHE_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            return data['locations'], data['cached_date']
-    except Exception as e:
-        st.error(f"Error reading cache: {e}")
-        return [], None
-
-def save_locations_to_cache(locations):
-    """Save locations to local cache file"""
-    try:
-        cache_data = {
-            'locations': locations,
-            'cached_date': time.strftime('%Y-%m-%d %H:%M:%S'),
-            'total_count': len(locations)
-        }
-        with open(CACHE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(cache_data, f, indent=2)
-        return True
-    except Exception as e:
-        st.error(f"Error saving cache: {e}")
-        return False
+CACHE_HOURS = 24  # Refresh cache after 24 hours
 
 def fetch_locations_from_api():
     """Fetch locations from DataForSEO API"""
@@ -97,31 +58,37 @@ def fetch_locations_from_api():
         st.error(f"Error fetching locations: {str(e)}")
         return []
 
-@st.cache_data(ttl=3600)  # Still cache in memory for 1 hour
-def load_all_locations(force_refresh=False):
-    """Load locations with smart caching strategy"""
+def is_cache_fresh():
+    """Check if the session state cache is fresh"""
+    if 'locations_cache_time' not in st.session_state:
+        return False
     
-    # Check if we should use cache
-    if not force_refresh and is_cache_fresh():
-        locations, cached_date = load_locations_from_cache()
-        if locations:
-            return locations, f"Using cached data from {cached_date}"
+    cache_age_hours = (time.time() - st.session_state.locations_cache_time) / 3600
+    return cache_age_hours < CACHE_HOURS
+
+@st.cache_data(ttl=2592000)  # Cache for 30 days across all users
+def load_all_locations(force_refresh=False):
+    """Load locations with session state caching strategy"""
+    
+    # Check session state cache first (unless forced refresh)
+    if not force_refresh and 'locations_data' in st.session_state and is_cache_fresh():
+        cached_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(st.session_state.locations_cache_time))
+        return st.session_state.locations_data, f"Using cached data from {cached_time}"
     
     # Fetch from API
     locations = fetch_locations_from_api()
     
     if locations:
-        # Save to cache
-        if save_locations_to_cache(locations):
-            return locations, f"Fresh data fetched and cached ({len(locations):,} locations)"
-        else:
-            return locations, f"Fresh data fetched ({len(locations):,} locations) - cache save failed"
+        # Store in session state instead of file
+        st.session_state.locations_data = locations
+        st.session_state.locations_cache_time = time.time()
+        
+        return locations, f"Fresh data fetched and cached ({len(locations):,} locations)"
     else:
-        # Fallback to cache even if expired
-        if os.path.exists(CACHE_FILE):
-            locations, cached_date = load_locations_from_cache()
-            if locations:
-                return locations, f"API failed - using stale cache from {cached_date}"
+        # Fallback to session state cache even if expired
+        if 'locations_data' in st.session_state:
+            cached_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(st.session_state.locations_cache_time))
+            return st.session_state.locations_data, f"API failed - using stale cache from {cached_time}"
         
         return [], "Failed to load locations from API and no cache available"
 
@@ -243,7 +210,6 @@ if st.button("Get Search Volumes"):
                     st.write(f"Task {task_idx}: Status code = {task.get('status_code')}")
                 
                 if task.get("status_code") == 20000:  # Success code
-                    # Fix: result array contains the keyword data directly, not nested in "items"
                     result_items = task.get("result", [])
                     
                     if debug_mode:
@@ -279,6 +245,12 @@ if st.button("Get Search Volumes"):
 st.markdown("---")
 if st.button("🔄 Refresh Location Database"):
     st.cache_data.clear()  # Clear streamlit cache
+    # Clear session state cache
+    if 'locations_data' in st.session_state:
+        del st.session_state.locations_data
+    if 'locations_cache_time' in st.session_state:
+        del st.session_state.locations_cache_time
+    
     with st.spinner("Fetching fresh location data..."):
         all_locations, cache_status = load_all_locations(force_refresh=True)
     st.success("Location database refreshed!")
